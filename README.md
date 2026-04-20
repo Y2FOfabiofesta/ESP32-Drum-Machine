@@ -1,6 +1,10 @@
 # ESP32-Drum-Machine
 Virtual/analog and FM modelling drum machine. Run on ESP32 S3 board.
 
+
+<img width="1600" height="811" alt="WhatsApp Image 2026-04-20 at 14 12 49" src="https://github.com/user-attachments/assets/280103f1-2e37-4d02-95f3-d5c4012ae49a" />
+
+
 ESP32-S3 Polyphonic Groovebox & Drum Machine
 A high-performance, 8-track digital groovebox powered by the ESP32-S3 microcontroller. This project features a custom-built DSP engine capable of real-time FM synthesis, virtual analog subtractive synthesis, sample-accurate sequencing, and master bus effects, all running flawlessly on a microcontroller.
 

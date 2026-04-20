@@ -1,0 +1,894 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_ADS1X15.h>
+#include <Adafruit_NeoTrellis.h>
+#include <ESP32Encoder.h>
+#include <driver/i2s.h>
+#include <math.h>
+#include <Preferences.h>
+
+// --- ESP32-S3 PINOUT SICURO ---
+#define I2C_SDA 8
+#define I2C_SCL 9
+
+#define I2S_BCLK 4
+#define I2S_LRCK 5
+#define I2S_DOUT 6
+
+#define ENC0_A 10
+#define ENC0_B 11
+#define ENC1_A 12
+#define ENC1_B 13
+#define ENC2_A 14
+#define ENC2_B 15
+#define ENC3_A 16
+#define ENC3_B 17
+#define ENC4_A 21
+#define ENC4_B 47
+// -------------------------------
+
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Adafruit_ADS1115 ads;
+Adafruit_NeoTrellis trellis;
+ESP32Encoder encoder[5];
+Preferences preferences;
+
+// --- STATI DELLA UI ---
+bool isMenuOpen = false;
+bool isSetupMenuOpen = false;
+int setupSelectedIndex = 0;
+bool isAdjustingSetupValue = false;
+unsigned long ui_feedback_timer = 0;
+
+int presetSlot = 1; 
+
+// Variabili per i Moduli Speciali (UI)
+bool isProbMode = false;
+int8_t probStepSelected = -1;
+bool isSidechainMode = false;
+
+const char* InstNames[] = {"KICK", "SNARE", "CLAP", "CHH", "OHH", "TOM L", "TOM M", "TOM H", "SAW LO", "SAW HI", "FM LO", "FM HI", "SQR CH", "SQR CH", "MIN7 CH", "MIN7 CH"};
+
+// --- VARIABILI SWING & DJ FILTER ---
+int swing_percent = 50;
+bool isSwingMenuOpen = false;
+
+bool isDjFilterMode = false;
+int djFilterEncoder = -1;
+float dj_filter_val = 0.5f; 
+float dj_lp = 0.0f, dj_bp = 0.0f; // Stati del filtro DJ -12dB/oct
+
+enum ModuleType { MOD_PITCH, MOD_ADSR, MOD_FILTER, MOD_DYNAMICS, MOD_OVERDRIVE, MOD_LFO, MOD_COMPRESSOR, MOD_SIDECHAIN, MOD_PROB, MOD_CHOKE, MOD_SETUP, TOTAL_MODULES };
+const char* ModuleNames[] = {"PITCH", "ADSR", "FILTER", "DYNAMICS", "DRIVE", "LFO", "COMP", "SIDECH", "PROB", "CHOKE", "SETUP"};
+const char* ParamNamesA[] = {"PTC", "ATK", "CUT", "VOL", "DRV", "RATE", "AMT", "DEP", "PRB", "CHK", ""};
+const char* ParamNamesB[] = {"SWP", "REL", "RES", "SHP", "TONE", "DEP", "MAKE", "TIME", "PRB", "CHK", ""};
+
+ModuleType activeEncoders[4] = {MOD_PITCH, MOD_ADSR, MOD_FILTER, MOD_DYNAMICS};
+bool encSecondary[4] = {false, false, false, false};
+
+const char* SetupItems[] = {"< EXIT >", "SAVE PRESET", "LOAD PRESET", "CLEAR SEQ", "INIT PATCH", "BRIGHTNESS", "MASTER VOL", "BIT DEPTH"};
+const int TOTAL_SETUP_ITEMS = 8;
+
+ModuleType availableModules[TOTAL_MODULES];
+int numAvailableModules = 0;
+int menuSelectedIndex = 0;
+
+// ICONA 25x25
+const unsigned char icon_dummy[] PROGMEM = {
+  0xff, 0xff, 0xff, 0x80, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80,
+  0x80, 0x00, 0x00, 0x80, 0x80, 0x3c, 0x3c, 0x80, 0x80, 0x7e, 0x7e, 0x80,
+  0x80, 0xff, 0xff, 0x80, 0x81, 0xff, 0xff, 0x80, 0x83, 0xff, 0xff, 0x80,
+  0x87, 0xff, 0xff, 0x80, 0x8f, 0xff, 0xff, 0x80, 0x8f, 0xff, 0xff, 0x80,
+  0x87, 0xff, 0xff, 0x80, 0x83, 0xff, 0xff, 0x80, 0x81, 0xff, 0xff, 0x80,
+  0x80, 0xff, 0xff, 0x80, 0x80, 0x7e, 0x7e, 0x80, 0x80, 0x3c, 0x3c, 0x80,
+  0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80,
+  0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80,
+  0xff, 0xff, 0xff, 0x80
+};
+
+void updateAvailableModules() {
+    numAvailableModules = 0;
+    for (int m = 0; m < TOTAL_MODULES; m++) {
+        bool isAssigned = false;
+        if (m != MOD_SETUP) {
+            for (int e = 0; e < 4; e++) {
+                if (activeEncoders[e] == m) { isAssigned = true; break; }
+            }
+        }
+        if (!isAssigned) { availableModules[numAvailableModules] = (ModuleType)m; numAvailableModules++; }
+    }
+    if (menuSelectedIndex >= numAvailableModules) menuSelectedIndex = 0;
+}
+
+// --- VARIABILI HARDWARE & DSP ---
+int32_t last_enc[5] = {0, 0, 0, 0, 0};
+unsigned long lastPlayPress = 0;
+bool isSelectMode = false;
+bool isMuteMode = false;
+
+#define NUM_INSTS 16
+#define NUM_CORES 8 
+
+volatile int bpm = 120;
+volatile bool isPlaying = false;
+volatile int currentStep = -1;
+volatile double seq_sample_counter = 9999999.0;
+int selectedVoice = 0; 
+
+float master_volume = 0.8f; 
+int current_bit_depth = 16; 
+int trellis_brightness = 40;
+
+// GHOST ENVELOPES PER SIDECHAIN GLOBALE
+float ghost_sc_envs[16] = {0.0f};
+
+// INVILUPPI VISIVI PER I LED
+volatile float visual_envs[16] = {0.0f};
+
+// 1. I DATI DEGLI STRUMENTI (16 logici)
+struct InstParams { 
+    float pitch, sweep, attack, release, cutoff, res, volume, contour; 
+    float drive, tone;             
+    float lfo_rate, lfo_depth;     
+    float comp_amt, comp_make;     
+    float sc_depth, sc_time;       
+    int8_t sc_source;              
+    bool muted; 
+    bool steps[16]; 
+    volatile uint8_t step_probability[16]; 
+    volatile uint8_t step_accumulator[16]; 
+    int8_t choke_target;           
+};
+
+// 2. I MOTORI DSP (Solo 8 fisici)
+struct DspCore { 
+    bool active; 
+    int current_inst; 
+    unsigned long start_time; 
+    
+    float time; 
+    float f_low, f_band; float hpf_state; 
+    float phase1, phase2, phase3, phase4; 
+    float tone_lpf;  
+    float lfo_phase; 
+    float comp_env;  
+};
+
+volatile InstParams instruments[NUM_INSTS]; 
+DspCore cores[NUM_CORES];
+
+// --- MAPPA FISSA DELLE TRACCE (8 CORE) ---
+const int instToCore[16] = {
+    0,       // KICK -> Core 0
+    1, 1,    // SNARE, CLAP -> Core 1
+    2, 2,    // CHH, OHH -> Core 2
+    3, 3, 3, // TOM L, M, H -> Core 3
+    4, 4,    // SAW LO, HI -> Core 4 (Bassi)
+    5, 5,    // FM LO, HI -> Core 5 (Bassi 2)
+    6, 6,    // SQR CH, SQR CH -> Core 6 (Accordi)
+    7, 7     // MIN7, MIN7 -> Core 7 (Accordi 2)
+};
+
+// --- LOOK-UP TABLES ---
+#define LUT_SIZE 2048 
+float sineLUT[LUT_SIZE]; float expLUT[LUT_SIZE];
+float midiFreq[128]; 
+
+void initLUTs() { 
+    for(int i=0; i<LUT_SIZE; i++) { 
+        sineLUT[i] = sinf((float)i * 2.0f * M_PI / (float)LUT_SIZE); 
+        expLUT[i] = expf(-((float)i / (float)LUT_SIZE) * 5.0f); 
+    } 
+    for(int i=0; i<128; i++) {
+        midiFreq[i] = 440.0f * powf(2.0f, (i - 69) / 12.0f);
+    }
+}
+inline float fastSine(float phase) { float f_idx = phase * LUT_SIZE; int idx1 = (int)f_idx; return sineLUT[idx1] + (f_idx - (float)idx1) * (sineLUT[(idx1 + 1) % LUT_SIZE] - sineLUT[idx1]); }
+inline float fastExp(float p) { if (p >= 1.0f) return 0.0f; return expLUT[(int)(p * LUT_SIZE)]; }
+
+const float INV_SAMPLERATE = 0.0000226757f; 
+
+uint32_t lcg_seed = 12345;
+inline float noise_gen() { 
+    lcg_seed = (lcg_seed * 196314165) + 907633515;
+    return ((float)lcg_seed * 4.6566129e-10f) * 2.0f - 1.0f; 
+}
+
+const char* NoteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+String getNoteStr(int instId) {
+    float p_pitch = instruments[instId].pitch;
+    int type = instId;
+    float freq = 0.0f;
+
+    if (type == 0) freq = 35.0f + (p_pitch * 60.0f);
+    else if (type == 1) freq = 150.0f + (p_pitch * 100.0f);
+    else if (type == 5) freq = 65.0f + (p_pitch * 100.0f);
+    else if (type == 6) freq = 90.0f + (p_pitch * 100.0f);
+    else if (type == 7) freq = 130.0f + (p_pitch * 100.0f);
+    else if (type >= 8 && type <= 15) {
+        int midi_note;
+        if (type == 8 || type == 10) {
+            midi_note = 24 + (int)(p_pitch * 24.99f); 
+        } else {
+            midi_note = 36 + (int)(p_pitch * 24.99f); 
+        }
+        freq = midiFreq[midi_note];
+    }
+
+    if (freq < 10.0f) return "--"; 
+
+    int midi = roundf(12.0f * log2f(freq / 440.0f) + 69.0f);
+    if (midi < 0) midi = 0; if (midi > 127) midi = 127;
+    
+    return String(NoteNames[midi % 12]) + String((midi / 12) - 1);
+}
+
+// --- SISTEMA DI SALVATAGGIO ---
+void savePreset(int slot) {
+    preferences.begin("groovebox", false);
+    String keyPrefix = "p_" + String(slot);
+    preferences.putBytes((keyPrefix + "_v").c_str(), (const uint8_t*)instruments, sizeof(instruments));
+    preferences.putInt((keyPrefix + "_bpm").c_str(), bpm);
+    preferences.putFloat((keyPrefix + "_vol").c_str(), master_volume);
+    preferences.putInt((keyPrefix + "_bit").c_str(), current_bit_depth);
+    preferences.end();
+    ui_feedback_timer = millis();
+}
+
+void loadPreset(int slot) {
+    preferences.begin("groovebox", true);
+    String keyPrefix = "p_" + String(slot);
+    if (preferences.isKey((keyPrefix + "_bpm").c_str())) { 
+        preferences.getBytes((keyPrefix + "_v").c_str(), (uint8_t*)instruments, sizeof(instruments));
+        bpm = preferences.getInt((keyPrefix + "_bpm").c_str(), 120);
+        master_volume = preferences.getFloat((keyPrefix + "_vol").c_str(), 0.8f);
+        current_bit_depth = preferences.getInt((keyPrefix + "_bit").c_str(), 16);
+        
+        for(int i=0; i<NUM_INSTS; i++) {
+            for(int s=0; s<16; s++) instruments[i].step_accumulator[s] = 100;
+        }
+    }
+    preferences.end();
+    ui_feedback_timer = millis();
+}
+
+// Inizializza i parametri di una patch
+void initPatch() {
+    for(int i=0; i<NUM_INSTS; i++) { 
+        instruments[i].volume = 0.8f; instruments[i].cutoff = 0.6f; 
+        instruments[i].release = 0.3f; instruments[i].pitch = 0.5f; 
+        instruments[i].drive = 0.0f; instruments[i].tone = 1.0f;
+        instruments[i].lfo_rate = 0.5f; instruments[i].lfo_depth = 0.0f;
+        instruments[i].comp_amt = 0.0f; instruments[i].comp_make = 0.0f;
+        instruments[i].sc_depth = 0.0f; instruments[i].sc_time = 0.5f;
+        instruments[i].sc_source = -1; 
+        instruments[i].choke_target = -1; 
+        instruments[i].muted = false;
+        for(int s=0; s<16; s++) { instruments[i].steps[s] = false; instruments[i].step_probability[s] = 100; instruments[i].step_accumulator[s] = 100; }
+    }
+    for(int c=0; c<NUM_CORES; c++) {
+        cores[c].active = false; cores[c].current_inst = -1;
+    }
+}
+
+// --- SISTEMA DI ALLOCAZIONE VOCI A TRACCE FISSE ---
+void triggerInstrument(int inst_id) {
+    if (instruments[inst_id].muted) return;
+
+    int target_core = instToCore[inst_id];
+
+    cores[target_core].current_inst = inst_id;
+    cores[target_core].active = true;
+    cores[target_core].time = 0.0f;
+    cores[target_core].f_low = 0.0f;
+    
+    static int last_inst_on_core[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    if (last_inst_on_core[target_core] != inst_id) {
+        cores[target_core].phase1 = 0.0f;
+        cores[target_core].phase2 = 0.0f;
+        cores[target_core].phase3 = 0.0f;
+        cores[target_core].phase4 = 0.0f;
+        last_inst_on_core[target_core] = inst_id;
+    }
+}
+
+// --- MOTORE DSP ---
+float processVoice(int core_id, float dummyRate) {
+    DspCore *s = &cores[core_id];
+    
+    if (!s->active || s->current_inst < 0) return 0.0f;
+    
+    InstParams *p = (InstParams*)&instruments[s->current_inst]; 
+
+    s->time += INV_SAMPLERATE; float t = s->time;
+    float max_release = (s->current_inst == 4) ? 0.9f : 0.8f; 
+    float rel = (p->release * p->release) * max_release + 0.01f; 
+    float env = fastExp(t * (1.0f / rel));
+    
+    if (env <= 0.001f) { s->active = false; return 0.0f; }
+
+    float out = 0.0f;
+
+    // --- OSCILLATORI ---
+    if (s->current_inst == 0) { 
+        float freq = 35.0f + (p->pitch * 60.0f) + (fastExp(t * 10.0f) * 250.0f * p->sweep);
+        s->phase2 += (freq * (0.5f + (p->attack * 4.0f))) * INV_SAMPLERATE; if(s->phase2 >= 1.0f) s->phase2 -= 1.0f;
+        float carrier_phase = s->phase1 + (fastSine(s->phase2) * (fastExp(t * 28.57f) * p->contour * 0.2f));
+        s->phase1 += freq * INV_SAMPLERATE;
+        carrier_phase -= floorf(carrier_phase); out = fastSine(carrier_phase);
+        if (t < 0.002f) out *= (t * 500.0f); 
+    } 
+    else if (s->current_inst == 1) { 
+        s->phase1 += (150.0f + (fastExp(t * 20.0f) * 100.0f) + (p->pitch * 100.0f)) * INV_SAMPLERATE;
+        if(s->phase1 >= 1.0f) s->phase1 -= 1.0f;
+        out = fastSine(s->phase1) * fastExp(t * 10.0f) * 0.6f + noise_gen() * fastExp(t * 5.0f) * 0.4f;
+    } 
+    else if (s->current_inst == 2) { 
+        float clap_env = fastExp(t * 5.0f); if (t < 0.01f) clap_env = 1.0f; else if (t < 0.02f) clap_env = 0.5f; else if (t < 0.03f) clap_env = 0.8f;
+        out = noise_gen() * clap_env;
+    } 
+    else if (s->current_inst == 3 || s->current_inst == 4) { out = noise_gen(); } 
+    else if (s->current_inst >= 5 && s->current_inst <= 7) { 
+        float baseFreq = (s->current_inst == 5) ? 65.0f : ((s->current_inst == 6) ? 90.0f : 130.0f);
+        s->phase1 += (baseFreq + (fastExp(t * 5.0f) * 50.0f) + (p->pitch * 100.0f)) * INV_SAMPLERATE;
+        if(s->phase1 >= 1.0f) s->phase1 -= 1.0f; out = fastSine(s->phase1);
+    } 
+    else if (s->current_inst >= 8 && s->current_inst <= 15) { 
+        int midi_note;
+        if (s->current_inst == 8 || s->current_inst == 10) midi_note = 24 + (int)(p->pitch * 24.99f); 
+        else midi_note = 36 + (int)(p->pitch * 24.99f); 
+        float freq = midiFreq[midi_note];
+
+        if (s->current_inst == 8 || s->current_inst == 9) { 
+            s->phase1 += freq * INV_SAMPLERATE; if(s->phase1 >= 1.0f) s->phase1 -= 1.0f;
+            out = (((s->phase1 * 2.0f) - 1.0f) * 0.6f) + (fastSine(s->phase1) * 0.4f);
+        }
+        else if (s->current_inst == 10 || s->current_inst == 11) { 
+            s->phase2 += (freq * floorf(1.0f + (p->attack * 7.0f))) * INV_SAMPLERATE; if(s->phase2 >= 1.0f) s->phase2 -= 1.0f;
+            float carrier_phase = s->phase1 + (fastSine(s->phase2) * (p->contour * 0.6f));
+            s->phase1 += freq * INV_SAMPLERATE; carrier_phase -= floorf(carrier_phase); out = fastSine(carrier_phase);
+        }
+        else if (s->current_inst == 12 || s->current_inst == 13) { 
+            s->phase1 += midiFreq[midi_note] * INV_SAMPLERATE; if(s->phase1 >= 1.0f) s->phase1 -= 1.0f; 
+            s->phase2 += midiFreq[midi_note + 3] * INV_SAMPLERATE; if(s->phase2 >= 1.0f) s->phase2 -= 1.0f; 
+            s->phase3 += midiFreq[midi_note + 7] * INV_SAMPLERATE; if(s->phase3 >= 1.0f) s->phase3 -= 1.0f; 
+            out = ((s->phase1 < 0.5f ? 1.0f : -1.0f) + (s->phase2 < 0.5f ? 1.0f : -1.0f) + (s->phase3 < 0.5f ? 1.0f : -1.0f)) * 0.33f;
+        }
+        else if (s->current_inst == 14 || s->current_inst == 15) { 
+            s->phase1 += midiFreq[midi_note] * INV_SAMPLERATE; if(s->phase1 >= 1.0f) s->phase1 -= 1.0f;
+            s->phase2 += midiFreq[midi_note + 3] * INV_SAMPLERATE; if(s->phase2 >= 1.0f) s->phase2 -= 1.0f; 
+            s->phase3 += midiFreq[midi_note + 7] * INV_SAMPLERATE; if(s->phase3 >= 1.0f) s->phase3 -= 1.0f; 
+            s->phase4 += midiFreq[midi_note + 10] * INV_SAMPLERATE; if(s->phase4 >= 1.0f) s->phase4 -= 1.0f; 
+            out = ((s->phase1 < 0.5f ? 1.0f : -1.0f) + (s->phase2 < 0.5f ? 1.0f : -1.0f) + (s->phase3 < 0.5f ? 1.0f : -1.0f) + (s->phase4 < 0.5f ? 1.0f : -1.0f)) * 0.25f;
+        }
+    }
+    else { out = noise_gen(); }
+
+    // --- 1. OVERDRIVE (Per-Voice) ---
+    if (p->drive > 0.0f) {
+        out *= (1.0f + (p->drive * 15.0f));
+        if(out > 1.0f) out = 1.0f; else if(out < -1.0f) out = -1.0f; 
+        float tone_coeff = 0.05f + (p->tone * 0.95f);
+        s->tone_lpf += tone_coeff * (out - s->tone_lpf);
+        out = s->tone_lpf;
+    }
+
+    // --- 2. LFO -> FILTRO ---
+    s->lfo_phase += (0.1f + p->lfo_rate * 20.0f) * INV_SAMPLERATE;
+    if(s->lfo_phase >= 1.0f) s->lfo_phase -= 1.0f;
+    
+    float lfo_val = fastSine(s->lfo_phase) * p->lfo_depth; 
+    
+    float mod_cutoff = p->cutoff + lfo_val;
+    if(mod_cutoff > 1.0f) mod_cutoff = 1.0f; if(mod_cutoff < 0.0f) mod_cutoff = 0.0f;
+
+    float coeff = mod_cutoff * mod_cutoff * mod_cutoff;
+    if (coeff < 0.005f) coeff = 0.005f; if (coeff > 0.99f) coeff = 1.0f;
+
+    if (s->current_inst == 2 || s->current_inst == 3 || s->current_inst == 4) { 
+        s->f_low += coeff * (out - s->f_low); out = out - s->f_low; 
+    } else { 
+        s->f_low += coeff * (out - s->f_low); out = s->f_low; 
+    }
+
+    // --- 3. COMPRESSORE OTTIMIZZATO ---
+    if (p->comp_amt > 0.0f || p->comp_make > 0.0f) {
+        float abs_out = fabsf(out);
+        s->comp_env += (abs_out > s->comp_env ? 0.005f : 0.0001f) * (abs_out - s->comp_env);
+        
+        float threshold = 1.0f - p->comp_amt;
+        if (s->comp_env > threshold && threshold > 0.001f) {
+            float over = s->comp_env - threshold;
+            float gain_reduction = 1.0f - (over * 1.5f); 
+            if (gain_reduction < 0.1f) gain_reduction = 0.1f; 
+            out *= gain_reduction;
+        }
+        out *= (1.0f + p->comp_make * 4.0f); 
+    }
+
+    // --- 4. SIDECHAIN ---
+    if (p->sc_source >= 0 && p->sc_source < 16 && p->sc_depth > 0.0f) {
+        float duck_signal = ghost_sc_envs[p->sc_source];
+        float duck_curve = powf(duck_signal, 0.5f + (1.0f - p->sc_time) * 3.0f); 
+        float gain_reduction = 1.0f - (duck_curve * p->sc_depth);
+        if(gain_reduction < 0.0f) gain_reduction = 0.0f;
+        out *= gain_reduction;
+    }
+
+    return out * env * p->volume * 0.3f; 
+}
+
+float master_hpf = 0.0f;
+
+void AudioTask(void *pvParameters) {
+  int16_t tx_buffer[256 * 2]; size_t bytes_written;
+  float start_fade = 0.0f; 
+
+  for (;;) { 
+    float bc_steps = 0;
+    bool do_bitcrush = (current_bit_depth < 16);
+    if (do_bitcrush) bc_steps = powf(2.0f, (float)current_bit_depth) - 1.0f;
+
+    for (int i = 0; i < 256 * 2; i += 2) {
+        for(int v=0; v<16; v++) {
+            if(ghost_sc_envs[v] > 0.001f) ghost_sc_envs[v] *= 0.9999f; 
+            if(visual_envs[v] > 0.001f) visual_envs[v] *= 0.999f;
+        }
+
+        if (isPlaying) {
+            if (start_fade < 1.0f) start_fade += 0.0045f; 
+            
+            double base_sps = 661500.0 / (double)bpm;
+            float swing_float = swing_percent / 100.0f;
+            double samples_per_step = (currentStep % 2 == 0) ? (base_sps * swing_float * 2.0) : (base_sps * (1.0f - swing_float) * 2.0);
+
+            seq_sample_counter += 1.0;
+            if (seq_sample_counter >= samples_per_step) {
+                seq_sample_counter = 0; 
+                currentStep = (currentStep + 1) % 16;
+                
+                for (int v=0; v<NUM_INSTS; v++) { 
+                    if (instruments[v].steps[currentStep]) { 
+                        instruments[v].step_accumulator[currentStep] += instruments[v].step_probability[currentStep];
+                        if (instruments[v].step_accumulator[currentStep] >= 100) {
+                            instruments[v].step_accumulator[currentStep] -= 100;
+                            
+                            visual_envs[v] = 1.0f; 
+                            
+                            if (!instruments[v].muted) { 
+                                triggerInstrument(v); 
+                                ghost_sc_envs[v] = 1.0f; 
+                                
+                                for(int c=0; c<NUM_INSTS; c++) {
+                                    if (instruments[c].choke_target == v && c != v) {
+                                        int core_of_c = instToCore[c]; 
+                                        if(cores[core_of_c].active && cores[core_of_c].current_inst == c) {
+                                            cores[core_of_c].active = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } 
+                }
+            }
+        } else {
+            start_fade = 0.0f; 
+        }
+        
+        float mix = 0.0f; 
+        for(int c=0; c<NUM_CORES; c++) { mix += processVoice(c, 44100.0f); }
+        
+        mix = mix * master_volume * 1.6f * start_fade; 
+
+        master_hpf += 0.002f * (mix - master_hpf);
+        mix -= master_hpf;
+
+        if (mix > 1.25f) mix = 1.25f;
+        else if (mix < -1.25f) mix = -1.25f;
+        mix = mix - (0.2133f * mix * mix * mix); 
+
+        static float smooth_dj = 0.5f;
+        smooth_dj += 0.005f * (dj_filter_val - smooth_dj);
+
+        if (smooth_dj < 0.49f || smooth_dj > 0.51f) {
+            float cutoff = 0.0f;
+            bool isHPF = false;
+            
+            if (smooth_dj < 0.5f) { 
+                cutoff = 0.01f + (smooth_dj * 2.0f) * 0.4f; 
+                isHPF = false;
+            } else { 
+                cutoff = 0.01f + ((smooth_dj - 0.5f) * 2.0f) * 0.45f; 
+                isHPF = true;
+            }
+            
+            float q = 0.5f; 
+            float f = sinf(M_PI * cutoff);
+            
+            dj_lp = dj_lp + f * dj_bp;
+            float hp = mix - dj_lp - q * dj_bp;
+            dj_bp = dj_bp + f * hp;
+            
+            mix = isHPF ? hp : dj_lp;
+        } else {
+            dj_lp = 0.0f; dj_bp = 0.0f; 
+        }
+
+        if (mix > 1.0f) mix = 1.0f; if (mix < -1.0f) mix = -1.0f; 
+        if (do_bitcrush) mix = roundf(mix * bc_steps) / bc_steps;
+        
+        int16_t sample = (int16_t)(mix * 32767.0f); 
+        tx_buffer[i] = sample; tx_buffer[i + 1] = sample;
+    }
+    i2s_write(I2S_NUM_0, &tx_buffer, sizeof(tx_buffer), &bytes_written, portMAX_DELAY);
+  }
+}
+
+// --- GRAFICA VETTORIALE ---
+float getParamValueForEncoder(int encIndex) {
+    ModuleType mod = activeEncoders[encIndex]; bool sec = encSecondary[encIndex];
+    if (mod == MOD_PITCH) return sec ? instruments[selectedVoice].sweep : instruments[selectedVoice].pitch;
+    if (mod == MOD_ADSR) return sec ? instruments[selectedVoice].release : instruments[selectedVoice].attack;
+    if (mod == MOD_FILTER) return sec ? instruments[selectedVoice].res : instruments[selectedVoice].cutoff;
+    if (mod == MOD_DYNAMICS) return sec ? instruments[selectedVoice].contour : instruments[selectedVoice].volume;
+    if (mod == MOD_OVERDRIVE) return sec ? instruments[selectedVoice].tone : instruments[selectedVoice].drive;
+    if (mod == MOD_LFO) return sec ? instruments[selectedVoice].lfo_depth : instruments[selectedVoice].lfo_rate;
+    if (mod == MOD_COMPRESSOR) return sec ? instruments[selectedVoice].comp_make : instruments[selectedVoice].comp_amt;
+    if (mod == MOD_SIDECHAIN) return sec ? instruments[selectedVoice].sc_time : instruments[selectedVoice].sc_depth;
+    
+    if (mod == MOD_PROB) {
+        if (probStepSelected != -1) return instruments[selectedVoice].step_probability[probStepSelected] / 100.0f;
+        return 1.0f;
+    }
+    if (mod == MOD_CHOKE) {
+        return (instruments[selectedVoice].choke_target + 1) / 16.0f; 
+    }
+    return 0.5f; 
+}
+
+void drawKnob(int x, int y, int radius, float value, const char* label, bool inverted = false) {
+    if (inverted) { display.fillCircle(x, y, radius, SSD1306_WHITE); } 
+    else { display.drawCircle(x, y, radius, SSD1306_WHITE); }
+
+    float angleRad = (135.0f + (value * 270.0f)) * M_PI / 180.0f;
+    int dotX = x + cos(angleRad) * (radius - 2); int dotY = y + sin(angleRad) * (radius - 2);
+
+    if (inverted) { display.fillCircle(dotX, dotY, 1, SSD1306_BLACK); } 
+    else { display.fillCircle(dotX, dotY, 1, SSD1306_WHITE); }
+
+    int16_t x1, y1; uint16_t w, h; 
+    display.getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(x - (w / 2), y + radius + 3); display.print(label);
+}
+
+// --- EVENTI TRELLIS ---
+TrellisCallback blink(keyEvent evt) {
+  if (evt.bit.EDGE == SEESAW_KEYPAD_EDGE_RISING) {
+    int key = evt.bit.NUM;
+    if (isSidechainMode) {
+        instruments[selectedVoice].sc_source = key; 
+        isSidechainMode = false; 
+    }
+    else if (isProbMode) {
+        probStepSelected = key;
+    } else if (isMuteMode) {
+        instruments[key].muted = !instruments[key].muted;
+    } else if (isSelectMode) {
+        selectedVoice = key;
+    } else {
+        instruments[selectedVoice].steps[key] = !instruments[selectedVoice].steps[key];
+        if (!instruments[selectedVoice].steps[key]) {
+            instruments[selectedVoice].step_accumulator[key] = 100;
+        }
+    }
+  }
+  return 0;
+}
+
+// --- GESTIONE AVANZATA PULSANTI ---
+void handleEncoderShortPress(int enc) {
+    if (enc == 4) { 
+        if (isSwingMenuOpen) {
+            isSwingMenuOpen = false; 
+            return;
+        }
+        if (isSetupMenuOpen) {
+            if (setupSelectedIndex == 0) { isSetupMenuOpen = false; } 
+            else if (setupSelectedIndex == 1 || setupSelectedIndex == 2 || setupSelectedIndex >= 5) { 
+                isAdjustingSetupValue = !isAdjustingSetupValue; 
+                if (!isAdjustingSetupValue) {
+                    if (setupSelectedIndex == 1) savePreset(presetSlot);
+                    if (setupSelectedIndex == 2) loadPreset(presetSlot);
+                }
+            } 
+            else {
+                if (setupSelectedIndex == 3) { for(int v=0; v<NUM_INSTS; v++) for(int s=0; s<16; s++) instruments[v].steps[s] = false; ui_feedback_timer = millis(); } 
+                else if (setupSelectedIndex == 4) { initPatch(); ui_feedback_timer = millis(); }
+            }
+        }
+        else if (isMenuOpen) {
+            if (availableModules[menuSelectedIndex] == MOD_SETUP) { isSetupMenuOpen = true; isMenuOpen = false; setupSelectedIndex = 0; }
+            else { isMenuOpen = false; } 
+        }
+        else { isMenuOpen = true; updateAvailableModules(); }
+    } else { 
+        if (isDjFilterMode && enc == djFilterEncoder) {
+            isDjFilterMode = false; 
+            return;
+        }
+        
+        ModuleType mod = activeEncoders[enc];
+        if(isMenuOpen && availableModules[menuSelectedIndex] != MOD_SETUP) { 
+            activeEncoders[enc] = availableModules[menuSelectedIndex]; isMenuOpen = false; 
+        } 
+        else if (!isMenuOpen) { 
+            if(mod == MOD_PROB) { 
+                isProbMode = !isProbMode; if(!isProbMode) probStepSelected = -1; 
+                isSidechainMode = false; 
+            } else { 
+                encSecondary[enc] = !encSecondary[enc]; 
+            } 
+        }
+    }
+}
+
+void handleEncoderLongPress(int enc) {
+    if (enc == 4 && !isMenuOpen && !isSetupMenuOpen) {
+        isSwingMenuOpen = true; 
+    }
+    else if (enc < 4 && !isMenuOpen) {
+        ModuleType mod = activeEncoders[enc];
+        if (mod == MOD_SIDECHAIN) {
+            isProbMode = false; 
+            isSidechainMode = true; 
+        }
+        else if (mod == MOD_FILTER) {
+            isDjFilterMode = true; 
+            djFilterEncoder = enc;
+        }
+    }
+}
+
+void setup() {
+  Serial.begin(115200); 
+  
+  // INIZIALIZZAZIONE I2C ESP32-S3
+  Wire.begin(I2C_SDA, I2C_SCL); 
+  
+  initLUTs();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C); display.setTextColor(SSD1306_WHITE); 
+  trellis.begin();
+  for(int i=0; i<16; i++) { trellis.activateKey(i, SEESAW_KEYPAD_EDGE_RISING); trellis.registerCallback(i, blink); }
+  trellis.pixels.setBrightness(trellis_brightness); trellis.pixels.show();
+  ads.begin(); ads.setGain(GAIN_ONE);
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  
+  // ENCODER SU ESP32-S3
+  encoder[0].attachHalfQuad(ENC0_A, ENC0_B); 
+  encoder[1].attachHalfQuad(ENC1_A, ENC1_B); 
+  encoder[2].attachHalfQuad(ENC2_A, ENC2_B); 
+  encoder[3].attachHalfQuad(ENC3_A, ENC3_B); 
+  encoder[4].attachHalfQuad(ENC4_A, ENC4_B);  
+
+  initPatch();
+  instruments[0].steps[0] = true; instruments[0].steps[4] = true; instruments[0].steps[8] = true; instruments[0].steps[12] = true; 
+
+  i2s_config_t i2s_config = { .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX), .sample_rate = 44100, .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, .communication_format = I2S_COMM_FORMAT_STAND_I2S, .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, .dma_buf_count = 4, .dma_buf_len = 256, .use_apll = false, .tx_desc_auto_clear = true };
+  i2s_pin_config_t pin_config = { .bck_io_num = I2S_BCLK, .ws_io_num = I2S_LRCK, .data_out_num = I2S_DOUT, .data_in_num = I2S_PIN_NO_CHANGE };
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL); i2s_set_pin(I2S_NUM_0, &pin_config);
+  
+  i2s_zero_dma_buffer(I2S_NUM_0); 
+  xTaskCreatePinnedToCore(AudioTask, "AudioTask", 10000, NULL, 2, NULL, 0); 
+  
+  loadPreset(1); 
+}
+
+void loop() {
+  int16_t val_A0 = ads.readADC_SingleEnded(0);
+  isSelectMode = (val_A0 > 22500 && val_A0 <= 25000);
+  isMuteMode = (val_A0 > 20000 && val_A0 <= 22500);
+  
+  if (val_A0 > 25000 && millis() - lastPlayPress > 300) {
+      isPlaying = !isPlaying; 
+      if (!isPlaying) { 
+          for(int i=0; i<NUM_CORES; i++) { cores[i].active = false; cores[i].f_low = 0.0f; } 
+          i2s_zero_dma_buffer(I2S_NUM_0); 
+      } else {
+          extern float master_hpf; master_hpf = 0.0f;
+          for(int i=0; i<NUM_CORES; i++) cores[i].f_low = 0.0f;
+          double samples_per_step = 661500.0 / (double)bpm; currentStep = 15; seq_sample_counter = samples_per_step; 
+      }
+      lastPlayPress = millis();
+  }
+
+  int16_t val_A1 = ads.readADC_SingleEnded(1);
+  int currentPressedEnc = -1;
+  if (val_A1 > 24000) currentPressedEnc = 0;
+  else if (val_A1 > 20000) currentPressedEnc = 1;
+  else if (val_A1 > 17500) currentPressedEnc = 2;
+  else if (val_A1 > 15500) currentPressedEnc = 3;
+  else if (val_A1 > 13000) currentPressedEnc = 4;
+
+  static int lastPressedEnc = -1;
+  static unsigned long pressStartTime = 0;
+  static bool longPressHandled = false;
+
+  if (currentPressedEnc != -1) {
+      if (lastPressedEnc == -1) { 
+          pressStartTime = millis(); longPressHandled = false; lastPressedEnc = currentPressedEnc;
+      } else if (lastPressedEnc == currentPressedEnc) { 
+          if (!longPressHandled && millis() - pressStartTime > 2000) { 
+              longPressHandled = true; handleEncoderLongPress(currentPressedEnc);
+          }
+      }
+  } else {
+      if (lastPressedEnc != -1) { 
+          if (!longPressHandled && millis() - pressStartTime > 50) { 
+              handleEncoderShortPress(lastPressedEnc);
+          }
+          lastPressedEnc = -1;
+      }
+  }
+
+  for(int i=0; i<5; i++) {
+      int32_t count = encoder[i].getCount() / 2; 
+      if(count != last_enc[i]) {
+          int dir = (count > last_enc[i]) ? 1 : -1;
+          
+          if (i == 4) { 
+              if (isSwingMenuOpen) {
+                  swing_percent = constrain(swing_percent + dir, 50, 75);
+              }
+              else if (isSetupMenuOpen) {
+                  if (isAdjustingSetupValue) {
+                      if (setupSelectedIndex == 1 || setupSelectedIndex == 2) { presetSlot = constrain(presetSlot + dir, 1, 8); }
+                      else if (setupSelectedIndex == 5) { trellis_brightness = constrain(trellis_brightness + dir*5, 0, 255); trellis.pixels.setBrightness(trellis_brightness); trellis.pixels.show(); }
+                      else if (setupSelectedIndex == 6) { master_volume = constrain(master_volume + dir*0.05f, 0.0f, 2.0f); }
+                      else if (setupSelectedIndex == 7) { current_bit_depth = constrain(current_bit_depth + (dir > 0 ? 4 : -4), 8, 16); }
+                  } else {
+                      setupSelectedIndex += dir; if(setupSelectedIndex >= TOTAL_SETUP_ITEMS) setupSelectedIndex = 0; if(setupSelectedIndex < 0) setupSelectedIndex = TOTAL_SETUP_ITEMS - 1;
+                  }
+              }
+              else if (isMenuOpen && numAvailableModules > 0) { 
+                  menuSelectedIndex += dir; if(menuSelectedIndex >= numAvailableModules) menuSelectedIndex = 0; if(menuSelectedIndex < 0) menuSelectedIndex = numAvailableModules - 1; 
+              } else { bpm = constrain(bpm + dir, 30, 250); }
+          } else if (!isMenuOpen && !isSetupMenuOpen) {
+              if (isDjFilterMode && i == djFilterEncoder) {
+                  dj_filter_val = constrain(dj_filter_val + dir * 0.02f, 0.0f, 1.0f);
+              } else {
+                  float fdir = dir * 0.05f; ModuleType mod = activeEncoders[i]; bool sec = encSecondary[i];
+                  
+                  if (mod == MOD_PROB && isProbMode && probStepSelected != -1) {
+                      int newValue = instruments[selectedVoice].step_probability[probStepSelected] + (dir * 10);
+                      newValue = constrain(newValue, 0, 100); instruments[selectedVoice].step_probability[probStepSelected] = newValue;
+                      if (newValue == 0) instruments[selectedVoice].step_accumulator[probStepSelected] = 0;
+                  }
+                  else if (mod == MOD_PITCH) { float p_dir = dir * 0.025f; if(sec) instruments[selectedVoice].sweep = constrain(instruments[selectedVoice].sweep + fdir, 0.0f, 1.0f); else instruments[selectedVoice].pitch = constrain(instruments[selectedVoice].pitch + p_dir, 0.0f, 1.0f); }
+                  else if (mod == MOD_ADSR) { if(sec) instruments[selectedVoice].release = constrain(instruments[selectedVoice].release + fdir, 0.0f, 1.0f); else instruments[selectedVoice].attack = constrain(instruments[selectedVoice].attack + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_FILTER) { if(sec) instruments[selectedVoice].res = constrain(instruments[selectedVoice].res + fdir, 0.0f, 1.0f); else instruments[selectedVoice].cutoff = constrain(instruments[selectedVoice].cutoff + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_DYNAMICS) { if(sec) instruments[selectedVoice].contour = constrain(instruments[selectedVoice].contour + fdir, 0.0f, 1.0f); else instruments[selectedVoice].volume = constrain(instruments[selectedVoice].volume + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_OVERDRIVE) { if(sec) instruments[selectedVoice].tone = constrain(instruments[selectedVoice].tone + fdir, 0.0f, 1.0f); else instruments[selectedVoice].drive = constrain(instruments[selectedVoice].drive + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_LFO) { if(sec) instruments[selectedVoice].lfo_depth = constrain(instruments[selectedVoice].lfo_depth + fdir, 0.0f, 1.0f); else instruments[selectedVoice].lfo_rate = constrain(instruments[selectedVoice].lfo_rate + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_COMPRESSOR) { if(sec) instruments[selectedVoice].comp_make = constrain(instruments[selectedVoice].comp_make + fdir, 0.0f, 1.0f); else instruments[selectedVoice].comp_amt = constrain(instruments[selectedVoice].comp_amt + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_SIDECHAIN && !isSidechainMode) { if(sec) instruments[selectedVoice].sc_time = constrain(instruments[selectedVoice].sc_time + fdir, 0.0f, 1.0f); else instruments[selectedVoice].sc_depth = constrain(instruments[selectedVoice].sc_depth + fdir, 0.0f, 1.0f); }
+                  else if (mod == MOD_CHOKE) { instruments[selectedVoice].choke_target = constrain(instruments[selectedVoice].choke_target + dir, -1, 15); }
+              }
+          }
+          last_enc[i] = count;
+      }
+  }
+
+  trellis.read();
+  for (int i=0; i<16; i++) {
+        uint32_t color = 0; 
+        bool active = instruments[selectedVoice].steps[i]; 
+        bool is_head = isPlaying && (i == currentStep);
+        bool has_cond = (instruments[selectedVoice].step_probability[i] < 100);
+
+        float v_env = visual_envs[i]; 
+        if (v_env < 0.0f) v_env = 0.0f; else if (v_env > 1.0f) v_env = 1.0f;
+
+        if (isSidechainMode) {
+            if (i == instruments[selectedVoice].sc_source) color = 0x800080; 
+            else color = 0x000000;
+        }
+        else if (isProbMode) {
+            if (i == probStepSelected) color = 0xFF8000; else if (is_head) color = 0xFFFFFF; else if (active) color = has_cond ? 0x80C800 : 0x00FFFF; else color = 0x000000;
+        }
+        else if (isMuteMode) {
+            if (instruments[i].muted) {
+                uint8_t r = 30 + (uint8_t)(v_env * 225.0f); 
+                color = (r << 16);
+            } else {
+                uint8_t g = 30 + (uint8_t)(v_env * 225.0f); 
+                color = (g << 8);
+            }
+        }
+        else if (isSelectMode) {
+            if (i == selectedVoice) {
+                uint8_t b = 50 + (uint8_t)(v_env * 205.0f); 
+                color = b;
+            } else {
+                uint8_t lum = 15 + (uint8_t)(v_env * 150.0f); 
+                color = (lum << 16) | (lum << 8) | lum;
+            }
+        }
+        else { 
+            if (is_head && active) color = 0xFFFFFF; else if (is_head) color = 0x333333; else if (active) color = has_cond ? 0x80C800 : 0x00FFFF; 
+        }
+        trellis.pixels.setPixelColor(i, color);
+  }
+  trellis.pixels.show();
+
+  display.clearDisplay(); display.setTextSize(1);
+  
+  if (isSwingMenuOpen) {
+      display.setCursor(20, 10); display.setTextSize(2); 
+      display.print(" SWING ");
+      display.setCursor(40, 35); display.setTextSize(3);
+      display.print(swing_percent); display.print("%");
+  }
+  else if (isSetupMenuOpen) {
+      display.setCursor(15, 0); display.print(" SYSTEM SETUP "); display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+      int start_idx = setupSelectedIndex - 2; if (start_idx < 0) start_idx = 0; if (start_idx > TOTAL_SETUP_ITEMS - 4) start_idx = TOTAL_SETUP_ITEMS - 4; 
+      for(int i=0; i<4; i++) {
+          int item_idx = start_idx + i; if (item_idx >= TOTAL_SETUP_ITEMS) break;
+          int y = 15 + (i * 12); display.setCursor(2, y); if (item_idx == setupSelectedIndex) display.print(">");
+          display.setCursor(15, y); display.print(SetupItems[item_idx]);
+          if (item_idx == 1 || item_idx == 2) { if (isAdjustingSetupValue && setupSelectedIndex == item_idx) { display.print(" ["); display.print(presetSlot); display.print("]"); } }
+          if (item_idx == 5) { display.print(isAdjustingSetupValue && setupSelectedIndex==5 ? " [" : " "); display.print(trellis_brightness); display.print(isAdjustingSetupValue && setupSelectedIndex==5 ? "]" : ""); }
+          if (item_idx == 6) { display.print(isAdjustingSetupValue && setupSelectedIndex==6 ? " [" : " "); display.print((int)(master_volume*100)); display.print("%"); display.print(isAdjustingSetupValue && setupSelectedIndex==6 ? "]" : ""); }
+          if (item_idx == 7) { display.print(isAdjustingSetupValue && setupSelectedIndex==7 ? " [" : " "); display.print(current_bit_depth); display.print("b"); display.print(isAdjustingSetupValue && setupSelectedIndex==7 ? "]" : ""); }
+      }
+      if (millis() - ui_feedback_timer < 1000) { display.fillRect(100, 0, 28, 10, SSD1306_BLACK); display.setCursor(105, 0); display.print("OK!"); }
+  }
+  else if (isMenuOpen && numAvailableModules > 0) {
+      int prevIdx = (menuSelectedIndex - 1 + numAvailableModules) % numAvailableModules; int nextIdx = (menuSelectedIndex + 1) % numAvailableModules;
+      display.setCursor(15, 0); display.print("    - MENU' -");
+      display.setTextSize(1); display.setCursor(20, 14); display.print(ModuleNames[availableModules[prevIdx]]);
+      display.setTextSize(2); display.setCursor(2, 27); display.print(">"); display.setCursor(20, 27); 
+      String focusName = String(ModuleNames[availableModules[menuSelectedIndex]]); if (focusName.length() > 6) { focusName = focusName.substring(0, 5) + "."; } display.print(focusName);
+      display.drawBitmap(101, 20, icon_dummy, 25, 25, SSD1306_WHITE);
+      display.setTextSize(1); display.setCursor(20, 50); display.print(ModuleNames[availableModules[nextIdx]]);
+  } 
+  else {
+      display.setCursor(0, 0); display.print(InstNames[selectedVoice]); 
+      display.setCursor(50, 0); display.print(getNoteStr(selectedVoice)); 
+      display.setCursor(90, 0); display.print(bpm); display.print("bpm"); display.drawLine(0, 12, 128, 12, SSD1306_WHITE);
+      
+      for(int i=0; i<4; i++) {
+          int knobX = 16 + (i * 32); int knobY = 32;            
+          float val = getParamValueForEncoder(i);
+          bool invertKnob = false; String dynamicLabel = ""; const char* finalLabel = "";
+          
+          if (activeEncoders[i] == MOD_PROB && isProbMode) {
+              invertKnob = true;
+              if (probStepSelected != -1) { dynamicLabel = String(instruments[selectedVoice].step_probability[probStepSelected]); finalLabel = dynamicLabel.c_str(); } 
+              else { finalLabel = "PRB"; }
+          } 
+          else if (activeEncoders[i] == MOD_SIDECHAIN && isSidechainMode) {
+              invertKnob = true; finalLabel = "SRC"; 
+          }
+          else if (isDjFilterMode && i == djFilterEncoder) {
+              invertKnob = true; 
+              finalLabel = " DJ "; 
+              val = dj_filter_val; 
+          }
+          else if (activeEncoders[i] == MOD_CHOKE) {
+              int target = instruments[selectedVoice].choke_target;
+              if (target == -1) finalLabel = "NO";
+              else finalLabel = InstNames[target]; 
+          }
+          else {
+              finalLabel = encSecondary[i] ? ParamNamesB[activeEncoders[i]] : ParamNamesA[activeEncoders[i]];
+          }
+          drawKnob(knobX, knobY, 10, val, finalLabel, invertKnob);
+      }
+  }
+
+  display.display(); delay(30); 
+}
